@@ -8,11 +8,35 @@
 #include <string.h>
 #include <sys/epoll.h>
 
+#include <stdio.h>  // 引入 printf 打印支持
+
 bool trace_complete(const TraceRow *trace) {
-    /* DAY1_G3_TODO_A: freeze one monotonic timing and workload baseline. */
-    /* DAY2_G3_TODO_A: validate four-stamp ordering and queue evidence. */
-    (void)trace;
-    return false;
+    if (trace == NULL) {
+        return false;
+    }
+
+    if (trace->t_pub_ns == 0 || trace->trace_id == 0 || trace->seq == 0) {
+        return false;
+    }
+
+    if (trace->t_rx_ns < trace->t_pub_ns || 
+        trace->t_gate_ns < trace->t_rx_ns || 
+        trace->t_ack_ns < trace->t_gate_ns) {
+        return false;
+    }
+
+    if (trace->t_ack_ns - trace->t_pub_ns == 0) {
+        return false;
+    }
+
+    if (trace->verdict != COURSE_VERDICT_APPROVE &&
+        trace->verdict != COURSE_VERDICT_REJECT &&
+        trace->verdict != COURSE_VERDICT_FALLBACK &&
+        trace->verdict != COURSE_VERDICT_DISCARD) {
+        return false;
+    }
+
+    return true;
 }
 
 int set_nonblocking(int fd) {
