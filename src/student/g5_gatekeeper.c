@@ -36,6 +36,13 @@ Verdict gatekeeper_process(FreshnessGate *freshness,
 
     /* DAY1_G5_TODO_A: reject a missing frame with an explicit BAD_FRAME trace
        before touching the writer queue. */
+    if (frame == NULL) {
+        if (trace != NULL) {
+            trace->reason = COURSE_REASON_BAD_FRAME;
+        }
+        return COURSE_VERDICT_REJECT;
+    }
+
     /* DAY2_G5_TODO_A: connect frame, freshness, and four-stamp trace. */
     /* DAY3_G5_TODO_A: keep repeated malformed-frame integration calls
        deterministic and non-writing under runtime load. */
