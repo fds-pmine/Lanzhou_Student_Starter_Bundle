@@ -8,9 +8,9 @@
 #include <string.h>
 #include <sys/epoll.h>
 
-#include <stdio.h>  // 引入 printf 打印支持
-
 bool trace_complete(const TraceRow *trace) {
+    /* DAY1_G3_TODO_A: freeze one monotonic timing and workload baseline. */
+    /* DAY2_G3_TODO_A: validate four-stamp ordering and queue evidence. */
     if (trace == NULL) {
         return false;
     }
@@ -19,13 +19,13 @@ bool trace_complete(const TraceRow *trace) {
         return false;
     }
 
-    if (trace->t_rx_ns < trace->t_pub_ns || 
-        trace->t_gate_ns < trace->t_rx_ns || 
-        trace->t_ack_ns < trace->t_gate_ns) {
+    if (trace->t_ack_ns - trace->t_pub_ns == 0) {
         return false;
     }
 
-    if (trace->t_ack_ns - trace->t_pub_ns == 0) {
+    if (trace->t_rx_ns < trace->t_pub_ns || 
+        trace->t_gate_ns < trace->t_rx_ns || 
+        trace->t_ack_ns < trace->t_gate_ns) {
         return false;
     }
 
@@ -54,7 +54,7 @@ int set_nonblocking(int fd) {
 }
 
 int poll_service_once(ClientState *clients, size_t client_count,
-                          int timeout_ms, RuntimeStats *stats) {
+                      int timeout_ms, RuntimeStats *stats) {
     struct pollfd fds[COURSE_MAX_CLIENTS];
     int ready;
 
@@ -65,6 +65,9 @@ int poll_service_once(ClientState *clients, size_t client_count,
     }
 
     memset(stats, 0, sizeof(*stats));
+    stats->max_queue_age_ns = COURSE_MAX_QUEUE_AGE_NS;
+    stats->max_work_per_client = COURSE_WORK_BUDGET;
+
     memset(fds, 0, sizeof(fds));
     for (size_t index = 0; index < client_count; index++) {
         clients[index].work_this_turn = 0;
