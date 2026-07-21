@@ -532,47 +532,154 @@ RxVerdict frame_feed(FrameParser *parser, uint8_t byte,
 }
 
 
+// Reason freshness_accept(FreshnessGate *gate,
+//                         const ArmCommand *command,
+//                         uint64_t now_ns) {
+//     (void)gate;
+//     (void)command;
+//     (void)now_ns;
+
+//     /* DAY2_G2_TODO_A: sequence, clock, age, then latest-value update. */
+//     return COURSE_REASON_STUDENT_TODO;
+// }
+
 Reason freshness_accept(FreshnessGate *gate,
                         const ArmCommand *command,
                         uint64_t now_ns) {
-    (void)gate;
-    (void)command;
-    (void)now_ns;
+    /* 基本参数检查 */
+    if (gate == NULL || command == NULL) {
+        return COURSE_REASON_BAD_FRAME;
+    }
 
-    /* DAY2_G2_TODO_A: sequence, clock, age, then latest-value update. */
-    return COURSE_REASON_STUDENT_TODO;
+    /* 1. 序列号递增检查 */
+    if (gate->has_last && command->seq <= gate->last_seq) {
+        return COURSE_REASON_NOT_NEW;
+    }
+
+    /* 2. 时钟合理性：源时间戳不能晚于当前时间（避免未来数据） */
+    if (now_ns < command->t_source_ns) {
+        return COURSE_REASON_CLOCK_ERROR;
+    }
+
+    /* 3. 命令年龄检查（不得陈旧） */
+    if (now_ns - command->t_source_ns > COURSE_MAX_CMD_AGE_NS) {
+        return COURSE_REASON_STALE_COMMAND;
+    }
+
+    /* 所有检查通过 → 更新门状态 */
+    gate->last_seq = command->seq;
+    gate->has_last = true;
+    gate->latest = *command;   /* 结构体整体赋值，包含所有字段 */
+    gate->has_latest = true;
+
+    return COURSE_REASON_NONE;
 }
-
 
 Reason transport_on_message(FreshnessGate *gate,
                             const uint8_t *bytes, size_t length,
                             uint64_t now_ns, TraceRow *trace,
                             ArmCommand *accepted) {
-    (void)gate;
-    (void)bytes;
-    (void)length;
-    (void)now_ns;
+    ArmCommand cmd;
+    RxVerdict rx;
+    Reason reason = COURSE_REASON_STUDENT_TODO;
 
+    /* 初始化输出参数（若有） */
     if (trace != NULL) {
         memset(trace, 0, sizeof(*trace));
         trace->verdict = COURSE_VERDICT_REJECT;
         trace->reason = COURSE_REASON_STUDENT_TODO;
     }
-
     if (accepted != NULL) {
         memset(accepted, 0, sizeof(*accepted));
     }
 
-    /* DAY2_G2_TODO_B: decode, stamp t_rx, gate, latest, trace and ACK. */
+    /*
+     * 1. 尝试解码帧，但不对序列号做检查（last_seq = 0），
+     *    因为序列号检查由 freshness_accept 负责。
+     */
+    rx = frame_decode(bytes, length, 0, &cmd);
+
+    /* 解码失败 → 返回 BAD_FRAME，并填充 trace */
+    if (rx != COURSE_RX_ACCEPT) {
+        reason = COURSE_REASON_BAD_FRAME;
+        if (trace != NULL) {
+            trace->trace_id = 0;          /* 无法可靠获取，置零 */
+            trace->seq = 0;
+            trace->t_pub_ns = 0;
+            trace->t_rx_ns = now_ns;
+            trace->t_gate_ns = now_ns;
+            trace->t_ack_ns = now_ns;
+            trace->verdict = COURSE_VERDICT_REJECT;
+            trace->reason = reason;
+        }
+        return reason;
+    }
 
     /*
-     * DAY3_G2_TODO_A: emit a complete four-stamp trace row for runtime
-     * handoff, including rejected messages.
+     * 2. 解码成功，调用 freshness_accept 做序列号、年龄、时钟检查。
+     *    该函数内部会更新 gate 的 last_seq 和 latest（仅当接受时）。
      */
+    reason = freshness_accept(gate, &cmd, now_ns);
 
-    /* DAY4_G2_TODO_A: preserve corrupt and stale rejection reasons. */
+    /*
+     * 3. 填充 trace 行（四个时间戳 + 判决）
+     *    t_rx_ns  = 接收时间（即 now_ns）
+     *    t_gate_ns = 门检查时间（可视为 now_ns，因为检查同步完成）
+     *    t_ack_ns  = 确认时间（同样设为 now_ns，满足顺序要求）
+     */
+    if (trace != NULL) {
+        trace->trace_id = cmd.trace_id;
+        trace->seq = cmd.seq;
+        trace->t_pub_ns = cmd.t_source_ns;
+        trace->t_rx_ns = now_ns;
+        trace->t_gate_ns = now_ns;   /* 门检查瞬间完成 */
+        trace->t_ack_ns = now_ns;    /* 确认瞬间完成（实际可稍后，但相等也合法） */
+        trace->verdict = (reason == COURSE_REASON_NONE)
+                             ? COURSE_VERDICT_APPROVE
+                             : COURSE_VERDICT_REJECT;
+        trace->reason = reason;
+    }
 
-    /* DAY5_G2_TODO_A: preserve emergency source age for priority dispatch. */
+    /*
+     * 4. 若接受，将解码后的命令复制给 accepted（若指针非空）。
+     *    freshness_accept 已更新 gate 内部状态，此处无需重复操作。
+     */
+    if (accepted != NULL && reason == COURSE_REASON_NONE) {
+        *accepted = cmd;
+    }
 
-    return COURSE_REASON_STUDENT_TODO;
+    return reason;
 }
+
+// Reason transport_on_message(FreshnessGate *gate,
+//                             const uint8_t *bytes, size_t length,
+//                             uint64_t now_ns, TraceRow *trace,
+//                             ArmCommand *accepted) {
+//     (void)gate;
+//     (void)bytes;
+//     (void)length;
+//     (void)now_ns;
+
+//     if (trace != NULL) {
+//         memset(trace, 0, sizeof(*trace));
+//         trace->verdict = COURSE_VERDICT_REJECT;
+//         trace->reason = COURSE_REASON_STUDENT_TODO;
+//     }
+
+//     if (accepted != NULL) {
+//         memset(accepted, 0, sizeof(*accepted));
+//     }
+
+//     /* DAY2_G2_TODO_B: decode, stamp t_rx, gate, latest, trace and ACK. */
+
+//     /*
+//      * DAY3_G2_TODO_A: emit a complete four-stamp trace row for runtime
+//      * handoff, including rejected messages.
+//      */
+
+//     /* DAY4_G2_TODO_A: preserve corrupt and stale rejection reasons. */
+
+//     /* DAY5_G2_TODO_A: preserve emergency source age for priority dispatch. */
+
+//     return COURSE_REASON_STUDENT_TODO;
+// }
