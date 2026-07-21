@@ -22,11 +22,14 @@ ControllerAction controller_sanitize(
     return COURSE_CONTROLLER_DISCARD;
 }
 
-Verdict gatekeeper_process(FreshnessGate *freshness,
-                                  ActuatorWriter *writer,
-                                  const ArmState *state,
-                                  const uint8_t *frame, size_t frame_length,
-                                  uint64_t now_ns, TraceRow *trace) {
+Verdict gatekeeper_process(
+    FreshnessGate *freshness,
+    ActuatorWriter *writer,
+    const ArmState *state,
+    const uint8_t *frame,
+    size_t frame_length,
+    uint64_t now_ns,
+    TraceRow *trace) {
     if (trace != NULL) {
         memset(trace, 0, sizeof(*trace));
         trace->t_gate_ns = now_ns;
@@ -34,30 +37,66 @@ Verdict gatekeeper_process(FreshnessGate *freshness,
         trace->reason = COURSE_REASON_STUDENT_TODO;
     }
 
-    /* DAY1_G5_TODO_A: reject a missing frame with an explicit BAD_FRAME trace
-       before touching the writer queue. */
+    /* Reject a missing frame before touching the writer queue. */
     if (frame == NULL) {
         if (trace != NULL) {
             trace->reason = COURSE_REASON_BAD_FRAME;
+            trace->t_ack_ns = now_ns;
         }
         return COURSE_VERDICT_REJECT;
     }
 
-    /* DAY2_G5_TODO_A: connect frame, freshness, and four-stamp trace. */
+    /* Connect FrameV1 integrity, freshness, and the four-stamp trace. */
+    ArmCommand command;
+    const uint64_t last_seq =
+        freshness != NULL && freshness->has_last
+            ? freshness->last_seq
+            : 0;
+    const RxVerdict rx =
+        frame_decode(frame, frame_length, last_seq, &command);
+    Reason reason;
+
+    if (rx == COURSE_RX_ACCEPT) {
+        reason = freshness != NULL
+                     ? freshness_accept(freshness, &command, now_ns)
+                     : COURSE_REASON_INTERNAL;
+    } else if (rx == COURSE_RX_NACK_SEQUENCE) {
+        reason = COURSE_REASON_NOT_NEW;
+    } else {
+        reason = COURSE_REASON_BAD_FRAME;
+    }
+
+    if (trace != NULL) {
+        if (rx == COURSE_RX_ACCEPT) {
+            trace->trace_id = command.trace_id;
+            trace->seq = command.seq;
+            trace->t_pub_ns = command.t_source_ns;
+            trace->t_rx_ns = now_ns;
+        }
+
+        trace->t_ack_ns = now_ns;
+        trace->verdict =
+            reason == COURSE_REASON_NONE
+                ? COURSE_VERDICT_APPROVE
+                : COURSE_VERDICT_REJECT;
+        trace->reason = reason;
+    }
+
     /* DAY3_G5_TODO_A: keep repeated malformed-frame integration calls
        deterministic and non-writing under runtime load. */
     /* DAY4_G5_TODO_A: route integration through the sole safe writer. */
     /* DAY5_G5_TODO_B: connect decode, freshness, safety, queue, and trace. */
-    (void)freshness;
     (void)writer;
     (void)state;
-    (void)frame;
-    (void)frame_length;
-    return COURSE_VERDICT_REJECT;
+
+    return reason == COURSE_REASON_NONE
+               ? COURSE_VERDICT_APPROVE
+               : COURSE_VERDICT_REJECT;
 }
 
-bool trace_replay_matches(const TraceRow *recorded,
-                              const TraceRow *replayed) {
+bool trace_replay_matches(
+    const TraceRow *recorded,
+    const TraceRow *replayed) {
     /* DAY5_G5_TODO: compare the frozen replay fields exactly. */
     (void)recorded;
     (void)replayed;
