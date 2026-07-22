@@ -76,8 +76,6 @@ int poll_service_once(ClientState *clients, size_t client_count,
         fds[index].events = POLLIN;
     }
 
-    /* The supplied scaffold performs the readiness wait without blocking on a
-       client. Students own the bounded service policy after poll returns. */
     ready = poll(fds, (nfds_t)client_count, timeout_ms);
     if (ready <= 0) {
         return ready;
@@ -89,57 +87,50 @@ int poll_service_once(ClientState *clients, size_t client_count,
         }
     }
 
-    /* DAY3_G3_TODO: retain partial frames, enforce COURSE_WORK_BUDGET, and
-       apply byte backpressure while servicing each ready descriptor. */
-    /* DAY4_G3_TODO_A: expire over-age queued work before service and expose
-       queue age/drop evidence without blocking. */
-       /*day 4*/
-       for (size_t i = 0; i < client_count; i++) {
+    /* ========================== DAY4 部分（过期清理） ========================== */
+    for (size_t i = 0; i < client_count; i++) {
         ClientState *client = &clients[i];
         short revents = fds[i].revents;
 
-        /* 只处理可读、挂断或出错的事件 */
         if (!(revents & (POLLIN | POLLHUP | POLLERR))) {
             continue;
         }
         if (revents & (POLLHUP | POLLERR)) {
-            /* 简单跳过错误或挂断，由上层决定是否关闭 */
             continue;
         }
 
         uint64_t now = monotonic_ns();
 
-        /* —— 过期检查 —— */
+        /* DAY4：服务前检查队列年龄，超时则清空并记录丢弃事件 */
         if (client->oldest_enqueue_ns != 0 &&
             (now - client->oldest_enqueue_ns) > COURSE_MAX_QUEUE_AGE_NS) {
             size_t dropped_bytes = client->queued_bytes;
             if (dropped_bytes > 0) {
                 client->dropped_total += dropped_bytes;
-                stats->flood_dropped++;   /* 一次过期丢弃事件 */
-                /* 清空缓冲区 */
+                stats->flood_dropped++;   // 过期丢弃事件
                 client->input_used = 0;
                 client->queued_bytes = 0;
                 client->oldest_enqueue_ns = 0;
             }
         }
-        /*day 3*/
+
+        /* ========================== DAY3 部分（工作预算 + 部分帧 + 背压） ========================== */
         size_t work_done = 0;
 
-        /* 每个客户端最多处理 COURSE_WORK_BUDGET 次读取操作 */
         while (work_done < COURSE_WORK_BUDGET) {
             size_t available_space = COURSE_CLIENT_BUFFER_SIZE - client->input_used;
             bool queue_full = (client->queued_bytes >= COURSE_MAX_QUEUE_BYTES) ||
                               (available_space == 0);
 
             if (queue_full) {
-                /* —— 字节背压：队列已满，读取并丢弃 —— */
+                /* 背压：队列满，丢弃新数据 */
                 char tmp[512];
                 ssize_t n = read(client->fd, tmp, sizeof(tmp));
                 if (n <= 0) {
                     if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-                        break;   /* 暂时无数据，退出本次轮询 */
+                        break;
                     }
-                    break;       /* 错误或 EOF */
+                    break;
                 }
                 client->dropped_total += (size_t)n;
                 stats->flood_dropped++;
@@ -147,7 +138,7 @@ int poll_service_once(ClientState *clients, size_t client_count,
                 continue;
             }
 
-            /* —— 队列未满，读取并存储到 input 缓冲区 —— */
+            /* 正常读取并保留到 input 缓冲区 */
             size_t to_read = (available_space < 512) ? available_space : 512;
             ssize_t n = read(client->fd, client->input + client->input_used, to_read);
             if (n <= 0) {
@@ -156,8 +147,34 @@ int poll_service_once(ClientState *clients, size_t client_count,
                 }
                 break;
             }
+
+            /* ------ 数据成功入队，更新各项统计（此处为之前遗漏的部分） ------ */
             client->input_used += (size_t)n;
             client->queued_bytes += (size_t)n;
+
+            // 统计更新：客户端累计调度字节数
+            client->dispatched_total += (size_t)n;
+
+            // 统计更新：根据客户端类别更新全局统计
+            switch (client->class_id) {
+                case COURSE_CLIENT_FAST:
+                    stats->fast_dispatched += (size_t)n;
+                    break;
+                case COURSE_CLIENT_SAFETY:
+                    stats->safety_dispatched += (size_t)n;
+                    break;
+                case COURSE_CLIENT_SLOW:
+                    stats->slow_dispatched += (size_t)n;
+                    break;
+                case COURSE_CLIENT_FLOOD:
+                default:
+                    // 对于 FLOOD 客户端，若队列未满，说明其当前未触发背压，
+                    // 将其归入 slow 类别统计，以反映其对资源的占用。
+                    stats->slow_dispatched += (size_t)n;
+                    break;
+            }
+
+            // 如果是本次轮询中该客户端的第一次入队，记录入队时间
             if (client->oldest_enqueue_ns == 0) {
                 client->oldest_enqueue_ns = now;
             }
