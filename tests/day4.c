@@ -578,7 +578,7 @@ static FaultObservation run_safety_fault(const Day4FaultFixture *fixture,
                                       "_over_10ms",
                                       &command.q_target_rad[0]);
     } else if (strcmp(fixture->category, "stale_state") == 0) {
-        uint64_t age_ns;
+        uint64_t age_ns = 0;
 
         input_ok =
             parse_input_u64(fixture->input, "state_age_ns=", &age_ns);

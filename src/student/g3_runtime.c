@@ -7,6 +7,7 @@
 #include <poll.h>
 #include <string.h>
 #include <sys/epoll.h>
+#include <unistd.h>
 
 bool trace_complete(const TraceRow *trace) {
     /* DAY1_G3_TODO_A: freeze one monotonic timing and workload baseline. */
@@ -23,8 +24,8 @@ bool trace_complete(const TraceRow *trace) {
         return false;
     }
 
-    if (trace->t_rx_ns < trace->t_pub_ns || 
-        trace->t_gate_ns < trace->t_rx_ns || 
+    if (trace->t_rx_ns < trace->t_pub_ns ||
+        trace->t_gate_ns < trace->t_rx_ns ||
         trace->t_ack_ns < trace->t_gate_ns) {
         return false;
     }
@@ -92,6 +93,80 @@ int poll_service_once(ClientState *clients, size_t client_count,
        apply byte backpressure while servicing each ready descriptor. */
     /* DAY4_G3_TODO_A: expire over-age queued work before service and expose
        queue age/drop evidence without blocking. */
+       /*day 4*/
+       for (size_t i = 0; i < client_count; i++) {
+        ClientState *client = &clients[i];
+        short revents = fds[i].revents;
+
+        /* 只处理可读、挂断或出错的事件 */
+        if (!(revents & (POLLIN | POLLHUP | POLLERR))) {
+            continue;
+        }
+        if (revents & (POLLHUP | POLLERR)) {
+            /* 简单跳过错误或挂断，由上层决定是否关闭 */
+            continue;
+        }
+
+        uint64_t now = monotonic_ns();
+
+        /* —— 过期检查 —— */
+        if (client->oldest_enqueue_ns != 0 &&
+            (now - client->oldest_enqueue_ns) > COURSE_MAX_QUEUE_AGE_NS) {
+            size_t dropped_bytes = client->queued_bytes;
+            if (dropped_bytes > 0) {
+                client->dropped_total += dropped_bytes;
+                stats->flood_dropped++;   /* 一次过期丢弃事件 */
+                /* 清空缓冲区 */
+                client->input_used = 0;
+                client->queued_bytes = 0;
+                client->oldest_enqueue_ns = 0;
+            }
+        }
+        /*day 3*/
+        size_t work_done = 0;
+
+        /* 每个客户端最多处理 COURSE_WORK_BUDGET 次读取操作 */
+        while (work_done < COURSE_WORK_BUDGET) {
+            size_t available_space = COURSE_CLIENT_BUFFER_SIZE - client->input_used;
+            bool queue_full = (client->queued_bytes >= COURSE_MAX_QUEUE_BYTES) ||
+                              (available_space == 0);
+
+            if (queue_full) {
+                /* —— 字节背压：队列已满，读取并丢弃 —— */
+                char tmp[512];
+                ssize_t n = read(client->fd, tmp, sizeof(tmp));
+                if (n <= 0) {
+                    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                        break;   /* 暂时无数据，退出本次轮询 */
+                    }
+                    break;       /* 错误或 EOF */
+                }
+                client->dropped_total += (size_t)n;
+                stats->flood_dropped++;
+                work_done++;
+                continue;
+            }
+
+            /* —— 队列未满，读取并存储到 input 缓冲区 —— */
+            size_t to_read = (available_space < 512) ? available_space : 512;
+            ssize_t n = read(client->fd, client->input + client->input_used, to_read);
+            if (n <= 0) {
+                if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+                    break;
+                }
+                break;
+            }
+            client->input_used += (size_t)n;
+            client->queued_bytes += (size_t)n;
+            if (client->oldest_enqueue_ns == 0) {
+                client->oldest_enqueue_ns = now;
+            }
+            work_done++;
+        }
+
+        client->work_this_turn = work_done;
+    }
+
     return ready;
 }
 
