@@ -1,129 +1,168 @@
 #include "course.h"
 
+#include <math.h>
 #include <string.h>
 
-ControllerAction controller_sanitize(
-    const ControllerResult *result,
-    uint64_t active_generation,
-    uint64_t now_ns,
-    const ArmState *state,
-    ArmCommand *command_out,
-    Reason *reason_out) {
-    if (command_out != NULL) {
-        memset(command_out, 0, sizeof(*command_out));
-    }
-
+static ControllerAction controller_discard(Reason reason,
+                                           Reason *reason_out) {
     if (reason_out != NULL) {
-        *reason_out = COURSE_REASON_STUDENT_TODO;
+        *reason_out = reason;
     }
-
-    /* DAY5_G5_TODO: contain timeout/NaN/range/confidence faults with the
-       frozen fallback or discard policy. */
-    (void)result;
-    (void)active_generation;
-    (void)now_ns;
-    (void)state;
-
     return COURSE_CONTROLLER_DISCARD;
 }
 
+ControllerAction controller_sanitize(
+    const ControllerResult *result, uint64_t active_generation,
+    uint64_t now_ns, const ArmState *state, ArmCommand *command_out,
+    Reason *reason_out) {
+    size_t joint;
+
+    if (command_out != NULL) {
+        memset(command_out, 0, sizeof(*command_out));
+    }
+    if (reason_out != NULL) {
+        *reason_out = COURSE_REASON_INTERNAL;
+    }
+
+    /*
+     * The Day 5 policy uses fail-closed discard for every controller fault.
+     * A command is copied out only after every frozen check has passed.
+     */
+    if (result == NULL || state == NULL || command_out == NULL) {
+        return controller_discard(COURSE_REASON_INTERNAL, reason_out);
+    }
+
+    if (result->generation != active_generation ||
+        result->command.generation != active_generation) {
+        return controller_discard(COURSE_REASON_CANCELLED, reason_out);
+    }
+
+    if (result->timed_out || result->produced_ns > now_ns ||
+        now_ns - result->produced_ns > COURSE_CONTROLLER_TIMEOUT_NS) {
+        return controller_discard(COURSE_REASON_CONTROLLER_TIMEOUT,
+                                  reason_out);
+    }
+
+    if (!isfinite(result->confidence)) {
+        return controller_discard(COURSE_REASON_CONTROLLER_INVALID,
+                                  reason_out);
+    }
+
+    for (joint = 0; joint < COURSE_ARM_DOF; ++joint) {
+        const double target = result->command.q_target_rad[joint];
+
+        if (!isfinite(target) || target < COURSE_JOINT_MIN_RAD ||
+            target > COURSE_JOINT_MAX_RAD) {
+            return controller_discard(COURSE_REASON_CONTROLLER_INVALID,
+                                      reason_out);
+        }
+    }
+
+    if (result->confidence < COURSE_MIN_CONTROLLER_CONFIDENCE) {
+        return controller_discard(COURSE_REASON_LOW_CONFIDENCE, reason_out);
+    }
+
+    *command_out = result->command;
+    command_out->generation = active_generation;
+    if (reason_out != NULL) {
+        *reason_out = COURSE_REASON_NONE;
+    }
+    return COURSE_CONTROLLER_USE;
+}
+
 Verdict gatekeeper_process(
-    FreshnessGate *freshness,
-    ActuatorWriter *writer,
-    const ArmState *state,
-    const uint8_t *frame,
-    size_t frame_length,
-    uint64_t now_ns,
-    TraceRow *trace) {
+    FreshnessGate *freshness, ActuatorWriter *writer,
+    const ArmState *state, const uint8_t *frame, size_t frame_length,
+    uint64_t now_ns, TraceRow *trace) {
     ArmCommand command;
+    SafetyDecision safety;
     uint64_t last_seq;
     RxVerdict rx;
     Reason reason;
 
     if (trace != NULL) {
         memset(trace, 0, sizeof(*trace));
+        trace->t_rx_ns = now_ns;
         trace->t_gate_ns = now_ns;
+        trace->t_ack_ns = now_ns;
         trace->verdict = COURSE_VERDICT_REJECT;
-        trace->reason = COURSE_REASON_STUDENT_TODO;
+        trace->reason = COURSE_REASON_INTERNAL;
     }
 
-    /*
-     * Day 1 and Day 3:
-     * Reject missing and malformed frames before decoding, changing
-     * freshness state, or touching the writer queue.
-     */
+    /* Reject before decoding, changing freshness state, or touching writer. */
     if (frame == NULL || frame_length != COURSE_FRAME_V1_LEN) {
         if (trace != NULL) {
-            trace->t_ack_ns = now_ns;
-            trace->verdict = COURSE_VERDICT_REJECT;
             trace->reason = COURSE_REASON_BAD_FRAME;
         }
+        return COURSE_VERDICT_REJECT;
+    }
 
+    if (freshness == NULL || writer == NULL || state == NULL) {
         return COURSE_VERDICT_REJECT;
     }
 
     memset(&command, 0, sizeof(command));
+    last_seq = freshness->has_last ? freshness->last_seq : 0;
+    rx = frame_decode(frame, frame_length, last_seq, &command);
 
-    last_seq =
-        freshness != NULL && freshness->has_last
-            ? freshness->last_seq
-            : 0;
-
-    rx = frame_decode(
-        frame,
-        frame_length,
-        last_seq,
-        &command);
-
-    if (rx == COURSE_RX_ACCEPT) {
-        reason =
-            freshness != NULL
-                ? freshness_accept(freshness, &command, now_ns)
-                : COURSE_REASON_INTERNAL;
-    } else if (rx == COURSE_RX_NACK_SEQUENCE) {
-        reason = COURSE_REASON_NOT_NEW;
-    } else {
-        reason = COURSE_REASON_BAD_FRAME;
+    if (rx != COURSE_RX_ACCEPT) {
+        reason = rx == COURSE_RX_NACK_SEQUENCE
+                     ? COURSE_REASON_NOT_NEW
+                     : COURSE_REASON_BAD_FRAME;
+        if (trace != NULL) {
+            trace->reason = reason;
+        }
+        return COURSE_VERDICT_REJECT;
     }
 
     if (trace != NULL) {
-        if (rx == COURSE_RX_ACCEPT) {
-            trace->trace_id = command.trace_id;
-            trace->seq = command.seq;
-            trace->t_pub_ns = command.t_source_ns;
-            trace->t_rx_ns = now_ns;
-        }
-
-        trace->t_ack_ns = now_ns;
-        trace->verdict =
-            reason == COURSE_REASON_NONE
-                ? COURSE_VERDICT_APPROVE
-                : COURSE_VERDICT_REJECT;
-        trace->reason = reason;
+        trace->trace_id = command.trace_id;
+        trace->seq = command.seq;
+        trace->t_pub_ns = command.t_source_ns;
     }
 
-    /*
-     * Day 3:
-     * The writer is deliberately untouched. Repeated malformed inputs
-     * therefore produce the same REJECT/BAD_FRAME result and zero writes.
-     */
+    reason = freshness_accept(freshness, &command, now_ns);
+    if (reason != COURSE_REASON_NONE) {
+        if (trace != NULL) {
+            trace->reason = reason;
+        }
+        return COURSE_VERDICT_REJECT;
+    }
 
-    /* DAY4_G5_TODO_A: route integration through the sole safe writer. */
-    /* DAY5_G5_TODO_B: connect decode, freshness, safety, queue, and trace. */
-    (void)writer;
-    (void)state;
+    safety = safety_gate(state, &command, now_ns);
+    if (safety.verdict != COURSE_VERDICT_APPROVE) {
+        if (trace != NULL) {
+            trace->reason = safety.reason;
+        }
+        return COURSE_VERDICT_REJECT;
+    }
 
-    return reason == COURSE_REASON_NONE
-               ? COURSE_VERDICT_APPROVE
-               : COURSE_VERDICT_REJECT;
+    if (!actuator_submit(writer, &command)) {
+        if (trace != NULL) {
+            trace->reason = COURSE_REASON_INTERNAL;
+        }
+        return COURSE_VERDICT_REJECT;
+    }
+
+    if (trace != NULL) {
+        trace->verdict = COURSE_VERDICT_APPROVE;
+        trace->reason = COURSE_REASON_NONE;
+    }
+    return COURSE_VERDICT_APPROVE;
 }
 
-bool trace_replay_matches(
-    const TraceRow *recorded,
-    const TraceRow *replayed) {
-    /* DAY5_G5_TODO: compare the frozen replay fields exactly. */
-    (void)recorded;
-    (void)replayed;
+bool trace_replay_matches(const TraceRow *recorded,
+                          const TraceRow *replayed) {
+    if (recorded == NULL || replayed == NULL) {
+        return false;
+    }
 
-    return false;
+    return recorded->trace_id == replayed->trace_id &&
+           recorded->seq == replayed->seq &&
+           recorded->t_pub_ns == replayed->t_pub_ns &&
+           recorded->t_rx_ns == replayed->t_rx_ns &&
+           recorded->t_gate_ns == replayed->t_gate_ns &&
+           recorded->t_ack_ns == replayed->t_ack_ns &&
+           recorded->verdict == replayed->verdict &&
+           recorded->reason == replayed->reason;
 }
