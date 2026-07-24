@@ -17,7 +17,7 @@ bool state_valid(const ArmState *state, const ArmState *previous) {
 
     // 2. 遍历所有关节，检查有限值、关节极限和不确定度
     for (int i = 0; i < COURSE_ARM_DOF; ++i) {
-        // 数值必须有限 (finite values)，拒绝 NaN 或 Infinity
+        // 数值必须有限 (finite values)
         if (!isfinite(state->q_rad[i]) || 
             !isfinite(state->dq_rad_s[i]) || 
             !isfinite(state->sigma_q_rad[i])) {
@@ -44,12 +44,20 @@ bool state_valid(const ArmState *state, const ArmState *previous) {
         /* DAY5_G1_TODO_A: reject sequence or time regression during replay across
            the controller-host boundary. */
            
-        // Day 2 核心要求：拒绝非递增序列（即小于或等于前一个序号），以及拒绝时间倒退
-        if (state->seq <= previous->seq) {
-            return false;
-        }
-        if (state->t_mono_ns < previous->t_mono_ns) {
-            return false;
+        if (state->seq == 0) {
+            // 控制器发生了重启 (Fresh State)，序列号归 0。
+            // 此时只需要确保这不是一次连续发了两个 seq=0 的重放即可。
+            if (state->seq == previous->seq) {
+                return false; 
+            }
+        } else {
+            // 常规数据流：必须严格递增。拒绝任何序列号或时间的停滞与倒退。
+            if (state->seq <= previous->seq) {
+                return false;
+            }
+            if (state->t_mono_ns <= previous->t_mono_ns) {
+                return false;
+            }
         }
     }
 
@@ -62,40 +70,30 @@ void twin_step(ArmState *state, const ArmCommand *command, int64_t step_ns) {
     }
 
     /* DAY1_G1_TODO_B: deterministic fixed-step simulator update. */
-    
-    // 1. 将步长从纳秒 (ns) 转换为秒 (s)
     double dt = (double)step_ns / 1e9;
 
-    // 2. 遍历所有关节，实现确定性地向指令目标位置逼近
     for (int i = 0; i < COURSE_ARM_DOF; ++i) {
-        // 计算目标位置和当前位置的误差
         double error = command->q_target_rad[i] - state->q_rad[i];
         
-        // 计算在这个时间步长内，按照机器最大速率允许的最大步进量
         double max_delta = COURSE_MAX_JOINT_RATE_RAD_S * dt;
         double delta = error;
 
-        // 对移动量进行限幅钳位 (Clamping)
         if (delta > max_delta) {
             delta = max_delta;
         } else if (delta < -max_delta) {
             delta = -max_delta;
         }
 
-        // 确定性地更新状态位置
         state->q_rad[i] += delta;
-        // 确定性地推算并更新当前速度
         state->dq_rad_s[i] = delta / dt; 
     }
 
-    // 3. 更新状态时间与序列号
     state->t_mono_ns += step_ns;
     state->seq += 1;
 }
 
 uint64_t state_schema_hash(void) {
     /* DAY1_G1_TODO_C: hash the frozen field names, units and dimensions. */
-    
     const char *schema = "seq:u64,t_mono_ns:i64,frame_id:u8,q_rad:f64[3],dq_rad_s:f64[3],sigma_q_rad:f32[3]";
     
     uint64_t hash = 0xcbf29ce484222325ULL;
